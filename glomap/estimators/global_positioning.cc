@@ -25,24 +25,38 @@ GlobalPositioner::GlobalPositioner(const GlobalPositionerOptions& options)
   random_generator_.seed(options_.seed);
 }
 
+/**
+ * [功能描述]：求解全局相机位置估计问题，通过非线性优化确定所有相机的全局位置
+ * @param view_graph：视图图，包含图像对之间的相对位姿关系
+ * @param rigs：相机装备的映射表，存储多相机系统的配置信息
+ * @param cameras：相机参数映射表，存储相机内参等信息
+ * @param frames：帧的映射表，每个帧代表一个相机位姿
+ * @param images：图像映射表，存储图像的特征点和关联信息
+ * @param tracks：轨迹映射表，存储多视图三角化的3D点及其观测
+ * @return 优化是否成功，返回true表示求解可用，false表示失败
+ */
 bool GlobalPositioner::Solve(const ViewGraph& view_graph,
                              std::unordered_map<rig_t, Rig>& rigs,
                              std::unordered_map<camera_t, Camera>& cameras,
                              std::unordered_map<frame_t, Frame>& frames,
                              std::unordered_map<image_t, Image>& images,
                              std::unordered_map<track_t, Track>& tracks) {
+  // 检查相机装备数量，目前系统设计主要支持单个相机装备
   if (rigs.size() > 1) {
     LOG(ERROR) << "Number of camera rigs = " << rigs.size();
   }
+  // 验证图像数量，没有图像则无法进行位置估计
   if (images.empty()) {
     LOG(ERROR) << "Number of images = " << images.size();
     return false;
   }
+  // 验证图像对数量，如果约束类型不是仅使用点约束，则必须有图像对
   if (view_graph.image_pairs.empty() &&
       options_.constraint_type != GlobalPositionerOptions::ONLY_POINTS) {
     LOG(ERROR) << "Number of image_pairs = " << view_graph.image_pairs.size();
     return false;
   }
+  // 验证轨迹数量，如果约束类型不是仅使用相机约束，则必须有3D点轨迹
   if (tracks.empty() &&
       options_.constraint_type != GlobalPositionerOptions::ONLY_CAMERAS) {
     LOG(ERROR) << "Number of tracks = " << tracks.size();
@@ -51,116 +65,167 @@ bool GlobalPositioner::Solve(const ViewGraph& view_graph,
 
   LOG(INFO) << "Setting up the global positioner problem";
 
-  // Setup the problem.
+  // 1. 设置优化问题：创建Ceres问题实例，初始化损失函数和尺度参数
   SetupProblem(view_graph, rigs, tracks);
 
-  // Initialize camera translations to be random.
-  // Also, convert the camera pose translation to be the camera center.
+  // 2. 初始化相机位置为随机值
+  // 同时将相机位姿的平移部分转换为相机中心坐标（从世界系到相机系的变换）
   InitializeRandomPositions(view_graph, frames, images, tracks);
 
-  // Add the camera to camera constraints to the problem.
-  // TODO: support the relative constraints with trivial frames to a non trivial
-  // frame
+  // 3. 添加相机到相机的约束（基于相对位姿估计）
+  // TODO: 支持从平凡帧到非平凡帧的相对约束
+  // 如果约束类型不是仅使用点约束，则添加相机间的相对位姿约束
   if (options_.constraint_type != GlobalPositionerOptions::ONLY_POINTS) {
     AddCameraToCameraConstraints(view_graph, images);
   }
 
-  // Add the point to camera constraints to the problem.
+  // 4. 添加点到相机的约束（基于特征点观测）
+  // 如果约束类型不是仅使用相机约束，则添加3D点的重投影约束
   if (options_.constraint_type != GlobalPositionerOptions::ONLY_CAMERAS) {
     AddPointToCameraConstraints(rigs, cameras, frames, images, tracks);
   }
 
+  // 5. 将相机和3D点参数添加到参数组中
+  // 为Schur complement求解器设置参数块的分组，提高求解效率
   AddCamerasAndPointsToParameterGroups(rigs, frames, tracks);
 
-  // Parameterize the variables, set image poses / tracks / scales to be
-  // constant if desired
+  // 6. 参数化变量：根据配置设置某些变量为常量
+  // 例如固定某些图像位姿、3D点坐标或尺度参数
   ParameterizeVariables(rigs, frames, tracks);
 
   LOG(INFO) << "Solving the global positioner problem";
 
+  // 7. 使用Ceres求解器求解非线性最小二乘问题
   ceres::Solver::Summary summary;
+  // 设置是否输出优化过程到标准输出（根据日志级别）
   options_.solver_options.minimizer_progress_to_stdout = VLOG_IS_ON(2);
+  // 执行优化求解
   ceres::Solve(options_.solver_options, problem_.get(), &summary);
 
+  // 8. 根据日志级别输出求解报告
   if (VLOG_IS_ON(2)) {
-    LOG(INFO) << summary.FullReport();
+    LOG(INFO) << summary.FullReport();  // 详细报告
   } else {
-    LOG(INFO) << summary.BriefReport();
+    LOG(INFO) << summary.BriefReport();  // 简要报告
   }
 
+  // 9. 转换结果：将优化后的相机中心坐标转换回相机位姿的平移向量
+  // 同时应用相机装备的尺度因子
   ConvertResults(rigs, frames);
+  
+  // 返回优化结果是否可用（收敛且满足终止条件）
   return summary.IsSolutionUsable();
 }
 
+/**
+ * [功能描述]：初始化全局位置估计的优化问题，创建Ceres问题实例并配置相关参数
+ * @param view_graph：视图图，包含图像对信息，用于计算相机间约束的数量
+ * @param rigs：相机装备的映射表，每个装备对应一个尺度因子
+ * @param tracks：轨迹映射表，包含3D点及其在多个图像中的观测
+ * @return 无返回值
+ */
 void GlobalPositioner::SetupProblem(
     const ViewGraph& view_graph,
     const std::unordered_map<rig_t, Rig>& rigs,
     const std::unordered_map<track_t, Track>& tracks) {
+  // 配置Ceres问题选项
   ceres::Problem::Options problem_options;
+  // 设置损失函数所有权：不由Problem对象管理，由本类自行管理生命周期
   problem_options.loss_function_ownership = ceres::DO_NOT_TAKE_OWNERSHIP;
+  // 创建Ceres优化问题实例
   problem_ = std::make_unique<ceres::Problem>(problem_options);
+  // 根据配置选项创建损失函数（用于鲁棒估计，降低离群值影响）
   loss_function_ = options_.CreateLossFunction();
 
-  // Allocate enough memory for the scales. One for each residual.
-  // Due to possibly invalid image pairs or tracks, the actual number of
-  // residuals may be smaller.
-  scales_.clear();
+  // 为尺度参数预分配内存，每个残差项对应一个尺度参数
+  // 注意：由于可能存在无效的图像对或轨迹，实际残差数量可能小于预分配数量
+  scales_.clear();  // 清空之前的尺度参数
+  // 预留内存空间 = 图像对数量 + 所有轨迹的观测总数
+  // 图像对数量对应相机到相机的约束数量
+  // 轨迹观测总数对应点到相机的约束数量
   scales_.reserve(
       view_graph.image_pairs.size() +
       std::accumulate(tracks.begin(),
                       tracks.end(),
                       0,
                       [](int sum, const std::pair<track_t, Track>& track) {
+                        // 累加每个轨迹的观测数量（即该3D点在多少个图像中被观测到）
                         return sum + track.second.observations.size();
                       }));
 
-  // Initialize the rig scales to be 1.0.
+  // 初始化所有相机装备的尺度因子为1.0
+  // 尺度因子用于处理多相机系统中不同装备间的尺度不一致问题
   for (const auto& [rig_id, rig] : rigs) {
     rig_scales_.emplace(rig_id, 1.0);
   }
 }
 
+/**
+ * [功能描述]：初始化相机位置，根据配置选项设置为随机值或从位姿中提取相机中心
+ * @param view_graph：视图图，包含图像对之间的匹配关系
+ * @param frames：帧的映射表，每个帧代表一个相机位姿，需要初始化其位置
+ * @param images：图像映射表，包含图像与帧的关联关系
+ * @param tracks：轨迹映射表，包含3D点的观测信息，用于确定哪些帧需要约束
+ * @return 无返回值
+ */
 void GlobalPositioner::InitializeRandomPositions(
     const ViewGraph& view_graph,
     std::unordered_map<frame_t, Frame>& frames,
     std::unordered_map<image_t, Image>& images,
     std::unordered_map<track_t, Track>& tracks) {
+  // 创建集合存储需要被约束的帧ID（即参与优化的帧）
   std::unordered_set<image_t> constrained_positions;
   constrained_positions.reserve(frames.size());
+  
+  // 第一步：从视图图中收集受约束的帧
+  // 遍历所有图像对，将有效图像对中的两个图像对应的帧标记为需要约束
   for (const auto& [pair_id, image_pair] : view_graph.image_pairs) {
-    if (image_pair.is_valid == false) continue;
+    if (image_pair.is_valid == false) continue;  // 跳过无效的图像对
+    // 将图像对的两个图像所属的帧ID加入约束集合
     constrained_positions.insert(images[image_pair.image_id1].frame_id);
     constrained_positions.insert(images[image_pair.image_id2].frame_id);
   }
 
+  // 第二步：从轨迹中收集受约束的帧
+  // 遍历所有3D点轨迹，将观测到足够次数的轨迹所涉及的帧标记为需要约束
   for (const auto& [track_id, track] : tracks) {
+    // 跳过观测数量不足的轨迹（观测太少的点不可靠）
     if (track.observations.size() < options_.min_num_view_per_track) continue;
+    // 遍历该轨迹的所有观测
     for (const auto& observation : tracks[track_id].observations) {
-      if (images.find(observation.first) == images.end()) continue;
+      if (images.find(observation.first) == images.end()) continue;  // 图像不存在则跳过
       Image& image = images[observation.first];
-      if (!image.IsRegistered()) continue;
+      if (!image.IsRegistered()) continue;  // 图像未注册则跳过
+      // 将观测到该3D点的图像所属的帧ID加入约束集合
       constrained_positions.insert(images[observation.first].frame_id);
     }
   }
 
+  // 第三步：根据配置决定是否生成随机位置
+  // 如果不生成随机位置或不优化位置，则仅将位姿转换为相机中心坐标
   if (!options_.generate_random_positions || !options_.optimize_positions) {
     for (auto& [frame_id, frame] : frames) {
+      // 对于受约束的帧，将其位姿的平移部分转换为相机中心坐标
+      // CenterFromPose: 从相机位姿 T_world_from_cam 中提取相机中心 C = -R^T * t
       if (constrained_positions.find(frame_id) != constrained_positions.end())
         frame.RigFromWorld().translation = CenterFromPose(frame.RigFromWorld());
     }
     return;
   }
 
-  // Generate random positions for the cameras centers.
+  // 第四步：为相机中心生成随机位置（用于优化初始化）
   for (auto& [frame_id, frame] : frames) {
-    // Only set the cameras to be random if they are needed to be optimized
+    // 仅为需要优化的相机设置随机位置
     if (constrained_positions.find(frame_id) != constrained_positions.end())
+      // 生成范围在[-100, 100]的随机3D坐标作为初始相机中心
       frame.RigFromWorld().translation =
           100.0 * RandVector3d(random_generator_, -1, 1);
     else
+      // 不需要约束的帧，从位姿中提取相机中心（保持原有值）
       frame.RigFromWorld().translation = CenterFromPose(frame.RigFromWorld());
   }
 
+  // 输出受约束位置的数量（用于调试）
   VLOG(2) << "Constrained positions: " << constrained_positions.size();
 }
 
