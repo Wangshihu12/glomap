@@ -19,6 +19,21 @@ void ConvertGlomapToColmapImage(const Image& image,
   }
 }
 
+/**
+ * [功能描述]：将Glomap格式的重建数据转换为COLMAP格式
+ * 该函数将Glomap的相机、帧、图像、3D轨迹等数据结构转换为COLMAP的Reconstruction对象。
+ * 支持聚类簇过滤，可以只转换指定簇的数据。
+ * 
+ * @param rigs：相机装备映射表，键为装备ID，值为Rig对象
+ * @param cameras：相机参数映射表，键为相机ID，值为Camera对象
+ * @param frames：帧数据映射表，键为帧ID，值为Frame对象
+ * @param images：图像数据映射表，键为图像ID，值为Image对象
+ * @param tracks：3D点轨迹映射表，键为轨迹ID，值为Track对象
+ * @param reconstruction：输出的COLMAP重建对象（引用传递，函数会修改此对象）
+ * @param cluster_id：聚类簇ID，-1表示转换所有数据，否则只转换指定簇的数据，默认值为-1
+ * @param include_image_points：是否包含图像特征点，默认值为false
+ * @return 无返回值
+ */
 void ConvertGlomapToColmap(const std::unordered_map<rig_t, Rig>& rigs,
                            const std::unordered_map<camera_t, Camera>& cameras,
                            const std::unordered_map<frame_t, Frame>& frames,
@@ -27,47 +42,60 @@ void ConvertGlomapToColmap(const std::unordered_map<rig_t, Rig>& rigs,
                            colmap::Reconstruction& reconstruction,
                            int cluster_id,
                            bool include_image_points) {
-  // Clear the colmap reconstruction
+  // 清空COLMAP重建对象，确保从空白状态开始
   reconstruction = colmap::Reconstruction();
 
-  // Add cameras
+  // 第一步：添加所有相机参数到COLMAP重建对象
+  // 相机参数包括焦距、畸变参数等内参信息
   for (const auto& [camera_id, camera] : cameras) {
     reconstruction.AddCamera(camera);
   }
 
-  // Add rigs
+  // 第二步：添加相机装备（rigs）
+  // Rig表示多个相机的刚性组合，例如立体相机或多相机阵列
   for (const auto& [rig_id, rig] : rigs) {
     reconstruction.AddRig(rig);
   }
 
-  // Add frames
+  // 第三步：添加帧数据
   for (auto& [frame_id, frame] : frames) {
-    Frame frame_curr = frame;  // Copy the frame to avoid dangling pointer
-    frame_curr.ResetRigPtr();
+    Frame frame_curr = frame;  // 复制帧对象以避免悬空指针
+    frame_curr.ResetRigPtr();  // 重置rig指针，避免指针失效
     reconstruction.AddFrame(frame_curr);
   }
 
-  // Prepare the 2d-3d correspondences
+  // 第四步：准备2D-3D对应关系
+  // min_supports定义了一个3D点至少需要在多少张图像中被观测到
   size_t min_supports = 2;
+  // image_to_point3D存储每张图像的特征点对应的3D轨迹ID
+  // 结构：image_id -> [特征点索引对应的track_id数组]
   std::unordered_map<image_t, std::vector<track_t>> image_to_point3D;
+  
   if (tracks.size() > 0 || include_image_points) {
-    // Initialize every point to corresponds to invalid point
+    // 初始化每张图像的特征点，默认都对应到无效的3D点（-1）
     for (auto& [image_id, image] : images) {
+      // 跳过未注册的图像或不属于指定聚类簇的图像
       if (!image.IsRegistered() ||
           (cluster_id != -1 && image.ClusterId() != cluster_id))
         continue;
+      // 为每个特征点创建一个track_id槽位，初始值为-1（表示无对应3D点）
       image_to_point3D[image_id] =
           std::vector<track_t>(image.features.size(), -1);
     }
 
+    // 如果存在3D轨迹数据，则建立2D特征点到3D轨迹的映射关系
     if (tracks.size() > 0) {
       for (auto& [track_id, track] : tracks) {
+        // 跳过观测数量不足的轨迹（至少需要2个观测）
         if (track.observations.size() < min_supports) {
           continue;
         }
+        // 遍历该轨迹的所有观测
+        // observation.first是image_id，observation.second是特征点索引
         for (auto& observation : track.observations) {
           if (image_to_point3D.find(observation.first) !=
               image_to_point3D.end()) {
+            // 将该图像的对应特征点索引关联到当前track_id
             image_to_point3D[observation.first][observation.second] = track_id;
           }
         }
@@ -75,51 +103,68 @@ void ConvertGlomapToColmap(const std::unordered_map<rig_t, Rig>& rigs,
     }
   }
 
-  // Add points
+  // 第五步：添加3D点到COLMAP重建对象
   for (const auto& [track_id, track] : tracks) {
+    // 创建COLMAP格式的3D点
     colmap::Point3D colmap_point;
-    colmap_point.xyz = track.xyz;
-    colmap_point.color = track.color;
-    colmap_point.error = 0;
+    colmap_point.xyz = track.xyz;      // 3D点的世界坐标
+    colmap_point.color = track.color;  // 3D点的RGB颜色
+    colmap_point.error = 0;            // 初始化重投影误差为0
 
-    // Add track element
+    // 添加该3D点的所有观测（track elements）
     for (auto& observation : track.observations) {
       const Image& image = images.at(observation.first);
+      // 跳过未注册的图像或不属于指定聚类簇的图像
       if (!image.IsRegistered() ||
           (cluster_id != -1 && image.ClusterId() != cluster_id))
         continue;
+      
+      // 创建COLMAP格式的轨迹元素
       colmap::TrackElement colmap_track_el;
-      colmap_track_el.image_id = observation.first;
-      colmap_track_el.point2D_idx = observation.second;
+      colmap_track_el.image_id = observation.first;      // 观测到该点的图像ID
+      colmap_track_el.point2D_idx = observation.second;  // 该点在图像中的2D特征点索引
 
       colmap_point.track.AddElement(colmap_track_el);
     }
 
+    // 如果轨迹长度（观测数量）小于最小支持数，则跳过该点
     if (colmap_point.track.Length() < min_supports) continue;
 
+    // 压缩轨迹数据以节省内存
     colmap_point.track.Compress();
+    // 将3D点添加到重建对象中
     reconstruction.AddPoint3D(track_id, std::move(colmap_point));
   }
 
-  // Add images
+  // 第六步：添加图像到COLMAP重建对象
   for (const auto& [image_id, image] : images) {
     colmap::Image image_colmap;
+    // 检查该图像是否需要保留特征点信息
     bool keep_points =
         image_to_point3D.find(image_id) != image_to_point3D.end();
+    
+    // 将Glomap格式的图像转换为COLMAP格式
     ConvertGlomapToColmapImage(image, image_colmap, keep_points);
+    
+    // 如果需要保留特征点，则设置2D特征点到3D点的对应关系
     if (keep_points) {
       std::vector<track_t>& track_ids = image_to_point3D[image_id];
+      // 遍历图像的所有特征点
       for (size_t i = 0; i < image.features.size(); i++) {
+        // 如果该特征点有对应的3D点，且该3D点存在于重建中
         if (track_ids[i] != -1 && reconstruction.ExistsPoint3D(track_ids[i])) {
+          // 建立2D特征点到3D点的关联
           image_colmap.SetPoint3DForPoint2D(i, track_ids[i]);
         }
       }
     }
 
+    // 将图像添加到重建对象中
     reconstruction.AddImage(std::move(image_colmap));
   }
 
-  // Deregister frames
+  // 第七步：注销不需要的帧
+  // 如果帧未注册或不属于指定的聚类簇，则从重建中移除
   for (auto& [frame_id, frame] : frames) {
     if ((cluster_id != 0 && !frame.is_registered) ||
         (frame.cluster_id != cluster_id && cluster_id != -1)) {
@@ -127,6 +172,7 @@ void ConvertGlomapToColmap(const std::unordered_map<rig_t, Rig>& rigs,
     }
   }
 
+  // 第八步：更新所有3D点的重投影误差
   reconstruction.UpdatePoint3DErrors();
 }
 
